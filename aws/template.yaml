@@ -1,44 +1,47 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  SnsClub Canva カレンダー自動化（Web UI + 月次バッチ）を AWS Fargate で動かす。
-  田畑のMacに依存しない。 Web UI は ALB 経由、 月次バッチは EventBridge Scheduler が RunTask する。
+  SnsClub Canva カレンダー自動化（Web UI + 月次バッチ）を AWS Fargate で「使う時だけ」動かす。
+  固定費ゼロ設計: ロードバランサー無し、公開は ngrok（無料の固定ドメイン）、Web UI は無操作で自動停止。
 
 # ============================================================
-# 構成
-#   ALB (HTTPS) ──► Fargate Service (Web UI: webServer.js, Xvfb + Chromium)
-#   EventBridge Scheduler (毎月25日 9:00 JST) ──► Fargate RunTask (runScheduled.js --auto)
+# 構成（固定費が発生するリソースは無い）
+#   起動ページ (Lambda Function URL, 無料枠) ──► RunTask ──► Fargate Task [app + ngrok]
+#        スタッフはここでパスワードを入れて「起動」→ 2分後に ngrok の固定URLを開く
+#        Web UI は CANVA_IDLE_EXIT_MINUTES 分 無操作なら自分で終了（＝課金停止）
+#   EventBridge Scheduler (毎月25日 9:00 JST) ──► RunTask ──► Fargate Task [app のみ] runScheduled.js --auto
 #   S3 SessionBucket: Canva のログイン状態 (Cookie) を Web UI と バッチで共有
-#   ECR: GitHub Actions がイメージを push する
+#   ECR: GitHub Actions がイメージを push（RunTask は毎回 :latest を引く）
 # ============================================================
 
 Parameters:
   ProjectName:
     Type: String
     Default: snsclub-canva-calendar
-    Description: リソース名の接頭辞
   ImageTag:
     Type: String
     Default: latest
-    Description: 起動する ECR イメージのタグ（GitHub Actions が latest を push する）
   WebPassword:
     Type: String
     NoEcho: true
     MinLength: 8
-    Description: Web UI のログインパスワード（スタッフに共有するもの）
-  CertificateArn:
+    Description: Web UI のログインパスワード（今までと同じものでよい）
+  StartPageKey:
     Type: String
-    Default: ''
-    Description: ACM 証明書 ARN（HTTPS 用。空なら HTTP のみ＝検証用途）
-  AllowedCidr:
+    NoEcho: true
+    MinLength: 8
+    Description: 起動ページのパスワード（WebPassword と同じでもよい）
+  NgrokAuthtoken:
     Type: String
-    Default: 0.0.0.0/0
-    Description: Web UI にアクセスできる送信元（社内固定IPがあれば絞る）
-  DesiredCount:
+    NoEcho: true
+    Description: ngrok の Authtoken（ダッシュボード → Your Authtoken）。Mac で使っていた canva 用アカウントを流用可
+  NgrokDomain:
+    Type: String
+    Description: ngrok の固定ドメイン（例 syrup-figment-submitter.ngrok-free.dev）。https:// は付けない
+  IdleExitMinutes:
     Type: Number
-    Default: 0
-    MinValue: 0
-    MaxValue: 1
-    Description: Web UI の常時稼働数。初回はイメージが無いので 0。イメージ push 後に 1 にする。使わない期間は 0 にして節約可
+    Default: 60
+    MinValue: 5
+    Description: Web UI を無操作でこの分数が経ったら自動停止する
   TaskCpu:
     Type: String
     Default: '2048'
@@ -66,12 +69,11 @@ Parameters:
     Description: 月次バッチの成否を通知する Discord Webhook（空なら通知しない）
 
 Conditions:
-  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
   HasDesignUrl: !Not [!Equals [!Ref CanvaDesignUrl, '']]
 
 Resources:
   # ------------------------------------------------------------
-  # ネットワーク（自己完結の小さな VPC。パブリックサブネット×2）
+  # ネットワーク（無料。パブリックサブネット×2、NAT 無し = 固定費なし）
   # ------------------------------------------------------------
   Vpc:
     Type: AWS::EC2::VPC
@@ -115,22 +117,12 @@ Resources:
   SubnetBRouteAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
-
-  AlbSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: !Sub '${ProjectName} ALB'
-      VpcId: !Ref Vpc
-      SecurityGroupIngress:
-        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr }
-        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr }
+  # 受信ポートは開けない。外からの入口は ngrok（コンテナから外向きに接続）だけ
   TaskSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: !Sub '${ProjectName} tasks'
+      GroupDescription: !Sub '${ProjectName} tasks (outbound only)'
       VpcId: !Ref Vpc
-      SecurityGroupIngress:
-        - { IpProtocol: tcp, FromPort: 4545, ToPort: 4545, SourceSecurityGroupId: !Ref AlbSecurityGroup }
 
   # ------------------------------------------------------------
   # 保存先・イメージ・ログ
@@ -146,19 +138,19 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
-      VersioningConfiguration: { Status: Enabled }   # ログイン状態を誤って上書きしても戻せる
+      VersioningConfiguration: { Status: Enabled }
   EcrRepository:
     Type: AWS::ECR::Repository
     Properties:
       RepositoryName: !Ref ProjectName
       ImageScanningConfiguration: { ScanOnPush: true }
       LifecyclePolicy:
-        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 10","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 5","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub '/ecs/${ProjectName}'
-      RetentionInDays: 90
+      RetentionInDays: 30
 
   # ------------------------------------------------------------
   # IAM
@@ -187,6 +179,24 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
                 Resource: [!GetAtt SessionBucket.Arn, !Sub '${SessionBucket.Arn}/*']
+  RunTaskPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # 循環参照を避けるため ARN パターンで指定 (WebTaskDefinition は起動ページの URL を参照するため)
+          - Effect: Allow
+            Action: ecs:RunTask
+            Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${ProjectName}-*:*'
+            Condition: { ArnLike: { 'ecs:cluster': !GetAtt Cluster.Arn } }
+          - Effect: Allow
+            Action: [ecs:ListTasks, ecs:DescribeTasks]
+            Resource: '*'
+            Condition: { ArnLike: { 'ecs:cluster': !GetAtt Cluster.Arn } }
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt TaskRole.Arn]
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -194,18 +204,17 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - { Effect: Allow, Principal: { Service: scheduler.amazonaws.com }, Action: sts:AssumeRole }
-      Policies:
-        - PolicyName: run-task
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: ecs:RunTask
-                Resource: !Ref TaskDefinition
-                Condition: { ArnLike: { 'ecs:cluster': !GetAtt Cluster.Arn } }
-              - Effect: Allow
-                Action: iam:PassRole
-                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt TaskRole.Arn]
+      ManagedPolicyArns: [!Ref RunTaskPolicy]
+  StartFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref RunTaskPolicy
 
   # ------------------------------------------------------------
   # ECS
@@ -214,12 +223,57 @@ Resources:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: !Ref ProjectName
-      ClusterSettings: [{ Name: containerInsights, Value: disabled }]
 
-  TaskDefinition:
+  # ---- Web UI 用タスク: app + ngrok サイドカー。起動ページから RunTask される ----
+  WebTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Ref ProjectName
+      Family: !Sub '${ProjectName}-web'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      EphemeralStorage: { SizeInGiB: 30 }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:${ImageTag}'
+          Essential: true          # app が終了(自動停止)したらタスク全体が止まる
+          Environment:
+            - { Name: CANVA_WEB_PORT, Value: '4545' }
+            - { Name: CANVA_WEB_PASSWORD, Value: !Ref WebPassword }
+            - { Name: CANVA_SESSION_BUCKET, Value: !Ref SessionBucket }
+            - { Name: CANVA_PROFILE_DIR, Value: /data/profile }
+            - { Name: CANVA_DESIGN_URL, Value: !If [HasDesignUrl, !Ref CanvaDesignUrl, ''] }
+            - { Name: CANVA_IDLE_EXIT_MINUTES, Value: !Ref IdleExitMinutes }
+            - { Name: CANVA_START_PAGE_URL, Value: !GetAtt StartFunctionUrl.FunctionUrl }
+            - { Name: TZ, Value: Asia/Tokyo }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+        - Name: ngrok
+          Image: ngrok/ngrok:latest
+          Essential: false         # ngrok が落ちても app は続行（ログイン状態の保存などを守る）
+          Command: ['http', '4545', '--url', !Sub 'https://${NgrokDomain}', '--log', 'stdout']
+          Environment:
+            - { Name: NGROK_AUTHTOKEN, Value: !Ref NgrokAuthtoken }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ngrok
+
+  # ---- 月次バッチ用タスク: app のみ（ngrok 不要）----
+  BatchTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-batch'
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
       Cpu: !Ref TaskCpu
@@ -232,91 +286,21 @@ Resources:
         - Name: app
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:${ImageTag}'
           Essential: true
-          PortMappings: [{ ContainerPort: 4545, Protocol: tcp }]
+          Command: ['node', 'src/runScheduled.js', '--auto']
           Environment:
-            - { Name: CANVA_WEB_PORT, Value: '4545' }
-            - { Name: CANVA_WEB_PASSWORD, Value: !Ref WebPassword }
             - { Name: CANVA_SESSION_BUCKET, Value: !Ref SessionBucket }
             - { Name: CANVA_PROFILE_DIR, Value: /data/profile }
             - { Name: CANVA_DESIGN_URL, Value: !If [HasDesignUrl, !Ref CanvaDesignUrl, ''] }
-            - { Name: TZ, Value: Asia/Tokyo }
             - { Name: DISCORD_NOTIFY_WEBHOOK_URL, Value: !Ref DiscordNotifyWebhookUrl }
+            - { Name: TZ, Value: Asia/Tokyo }
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref LogGroup
               awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: app
+              awslogs-stream-prefix: batch
 
-  # ---- Web UI（常駐サービス。DesiredCount=0 で停止して節約可）----
-  LoadBalancer:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Scheme: internet-facing
-      Type: application
-      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
-      SecurityGroups: [!Ref AlbSecurityGroup]
-      LoadBalancerAttributes:
-        - { Key: idle_timeout.timeout_seconds, Value: '120' }   # 起動(Chromium)が数十秒かかるため
-  TargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      VpcId: !Ref Vpc
-      Protocol: HTTP
-      Port: 4545
-      TargetType: ip
-      HealthCheckPath: /healthz
-      HealthCheckIntervalSeconds: 30
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
-      TargetGroupAttributes:
-        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
-        - { Key: stickiness.enabled, Value: 'false' }
-  HttpListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - !If
-          - HasCertificate
-          - Type: redirect
-            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
-          - Type: forward
-            TargetGroupArn: !Ref TargetGroup
-  HttpsListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: HasCertificate
-    Properties:
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: 443
-      Protocol: HTTPS
-      Certificates: [{ CertificateArn: !Ref CertificateArn }]
-      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
-      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
-
-  Service:
-    Type: AWS::ECS::Service
-    DependsOn: HttpListener
-    Properties:
-      ServiceName: !Sub '${ProjectName}-web'
-      Cluster: !Ref Cluster
-      LaunchType: FARGATE
-      TaskDefinition: !Ref TaskDefinition
-      DesiredCount: !Ref DesiredCount
-      HealthCheckGracePeriodSeconds: 120
-      # ブラウザセッションは1つだけにする（同時に2タスク動かない）
-      DeploymentConfiguration: { MinimumHealthyPercent: 0, MaximumPercent: 100 }
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
-          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
-          SecurityGroups: [!Ref TaskSecurityGroup]
-      LoadBalancers:
-        - { ContainerName: app, ContainerPort: 4545, TargetGroupArn: !Ref TargetGroup }
-
-  # ---- 月次バッチ（毎月25日 9:00 JST に 1 タスク起動。終わったら消える）----
+  # ---- 月次バッチ（毎月25日 9:00 JST）----
   MonthlySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -331,7 +315,7 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         RetryPolicy: { MaximumRetryAttempts: 0 }   # 二重書き込み防止
         EcsParameters:
-          TaskDefinitionArn: !Ref TaskDefinition
+          TaskDefinitionArn: !Ref BatchTaskDefinition
           LaunchType: FARGATE
           TaskCount: 1
           NetworkConfiguration:
@@ -339,18 +323,84 @@ Resources:
               AssignPublicIp: ENABLED
               Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
               SecurityGroups: [!Ref TaskSecurityGroup]
-        Input: '{"containerOverrides":[{"name":"app","command":["node","src/runScheduled.js","--auto"]}]}'
+
+  # ------------------------------------------------------------
+  # 起動ページ: スタッフがブラウザから Web UI を立ち上げる（Lambda Function URL, 無料枠）
+  # ------------------------------------------------------------
+  StartFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-start'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt StartFunctionRole.Arn
+      Timeout: 20
+      Environment:
+        Variables:
+          CLUSTER: !Ref Cluster
+          TASK_DEF: !Sub '${ProjectName}-web'   # family 名 (最新リビジョンが使われる)
+          SUBNETS: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+          SECURITY_GROUP: !Ref TaskSecurityGroup
+          WEB_URL: !Sub 'https://${NgrokDomain}/'
+          START_KEY: !Ref StartPageKey
+          IDLE_MINUTES: !Ref IdleExitMinutes
+      Code:
+        ZipFile: |
+          // 起動ページ: GET でフォーム、POST(key) で Web UI タスクを RunTask する
+          const { ECSClient, RunTaskCommand, ListTasksCommand } = require("@aws-sdk/client-ecs");
+          const ecs = new ECSClient({});
+          const E = process.env;
+          const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+          const page = (body) => ({
+            statusCode: 200,
+            headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+            body: `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Canva カレンダー 起動</title><style>body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center}
+          .card{background:#1e293b;padding:28px;border-radius:16px;width:340px}h1{font-size:18px;margin:0 0 12px}input{width:100%;box-sizing:border-box;padding:12px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:16px}
+          button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:16px;font-weight:bold;cursor:pointer}a{color:#60a5fa}.note{font-size:13px;color:#94a3b8;margin-top:10px}</style></head><body><div class="card">${body}</div></body></html>`,
+          });
+          async function running() {
+            const r = await ecs.send(new ListTasksCommand({ cluster: E.CLUSTER, family: E.TASK_DEF, desiredStatus: "RUNNING" }));
+            return (r.taskArns || []).length;
+          }
+          exports.handler = async (event) => {
+            const method = (event.requestContext && event.requestContext.http && event.requestContext.http.method) || "GET";
+            if (method !== "POST") {
+              return page(`<h1>📅 Canva カレンダー 起動</h1><form method="POST"><input type="password" name="key" placeholder="パスワード" autofocus><button>🚀 起動する</button></form>
+                <p class="note">起動後 2〜3分で <a href="${esc(E.WEB_URL)}">${esc(E.WEB_URL)}</a> が開けます。<br>${esc(E.IDLE_MINUTES)}分間 操作が無いと自動で停止します。</p>`);
+            }
+            const raw = event.isBase64Encoded ? Buffer.from(event.body || "", "base64").toString() : (event.body || "");
+            const key = new URLSearchParams(raw).get("key") || "";
+            if (key !== E.START_KEY) return page(`<h1>❌ パスワードが違います</h1><p class="note"><a href="">戻る</a></p>`);
+            if (await running()) {
+              return page(`<h1>✅ すでに起動中です</h1><p class="note"><a href="${esc(E.WEB_URL)}">${esc(E.WEB_URL)}</a> を開いてください。<br>開けない場合は1〜2分待ってから再度お試しください。</p>`);
+            }
+            await ecs.send(new RunTaskCommand({
+              cluster: E.CLUSTER, taskDefinition: E.TASK_DEF, launchType: "FARGATE", count: 1,
+              networkConfiguration: { awsvpcConfiguration: { subnets: E.SUBNETS.split(","), securityGroups: [E.SECURITY_GROUP], assignPublicIp: "ENABLED" } },
+            }));
+            return page(`<h1>🚀 起動しました</h1><p class="note">2〜3分ほど待ってから <a href="${esc(E.WEB_URL)}">${esc(E.WEB_URL)}</a> を開いてください。<br>初回は ngrok の警告ページが出るので「Visit Site」を押します。<br>${esc(E.IDLE_MINUTES)}分間 操作が無いと自動で停止します（また起動すれば使えます）。</p>`);
+          };
+  StartFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt StartFunction.Arn
+      AuthType: NONE
+  StartFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
 
 Outputs:
+  StartPageUrl:
+    Description: スタッフに配る「起動ページ」の URL（パスワードは StartPageKey）
+    Value: !GetAtt StartFunctionUrl.FunctionUrl
   WebUrl:
-    Description: Web UI の URL（HTTPS は CertificateArn を設定し、DNS でこのALBを指す）
-    Value: !If
-      - HasCertificate
-      - !Sub 'https://${LoadBalancer.DNSName}/'
-      - !Sub 'http://${LoadBalancer.DNSName}/'
-  LoadBalancerDnsName:
-    Description: 独自ドメインを使う場合、この DNS 名を CNAME/ALIAS に設定
-    Value: !GetAtt LoadBalancer.DNSName
+    Description: 起動後にアクセスする Web UI の URL（ngrok 固定ドメイン）
+    Value: !Sub 'https://${NgrokDomain}/'
   EcrRepositoryUri:
     Description: GitHub Actions の push 先
     Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}'
@@ -359,13 +409,10 @@ Outputs:
     Value: !Ref SessionBucket
   ClusterName:
     Value: !Ref Cluster
-  ServiceName:
-    Value: !GetAtt Service.Name
-  TaskDefinitionArn:
+  BatchTaskDefinitionArn:
     Description: 手動で月次バッチを動かすときに RunTask で指定
-    Value: !Ref TaskDefinition
+    Value: !Ref BatchTaskDefinition
   SubnetIds:
-    Description: 手動 RunTask 用
     Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
   TaskSecurityGroupId:
     Value: !Ref TaskSecurityGroup

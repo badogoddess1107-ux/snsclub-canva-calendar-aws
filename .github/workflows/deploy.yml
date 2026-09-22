@@ -3,16 +3,16 @@
 # ============================================================
 # 1. テスト
 # 2. Docker イメージを build → ECR に push (latest と コミットSHA)
-# 3. ECS サービスを新イメージで入れ替え (force-new-deployment)
+# 3. 完了。 Web UI / 月次バッチは RunTask のたびに :latest を引くので、 次回起動から新イメージになる
 #
 # 必要な GitHub Secrets (リポジトリ Settings → Secrets and variables → Actions):
-#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  … ECR push と ECS 更新ができる IAM ユーザー
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  … ECR に push できる IAM ユーザー
 #   AWS_REGION                                 … 例 ap-northeast-1
 # 任意:
 #   AWS_ROLE_ARN … OIDC で AssumeRole する場合はこちらを使い、上のキーは不要
 #
-# 初回だけ手順が前後する: 先に CloudFormation (aws/template.yaml) を DesiredCount=0 で作成し、
-# ECR リポジトリができてからこのワークフローを走らせる。 その後 DesiredCount=1 にする。
+# 初回は 先に CloudFormation (aws/template.yaml) を作成して ECR リポジトリを用意してから、
+# このワークフローを走らせる (順序が逆だと push 先が無い)。
 name: deploy
 
 on:
@@ -66,12 +66,7 @@ jobs:
           docker push "$IMAGE:${GITHUB_SHA::7}"
           echo "pushed $IMAGE:latest ($GITHUB_SHA)"
 
-      - name: ECS サービスを新イメージで再デプロイ
+      - name: 完了
         run: |
-          aws ecs update-service \
-            --cluster "$PROJECT_NAME" \
-            --service "$PROJECT_NAME-web" \
-            --force-new-deployment \
-            --query 'service.{status:status,desired:desiredCount,running:runningCount}' \
-            --output table
-          echo "※ desiredCount が 0 のときは起動しません。README の手順で 1 にしてください。"
+          echo "push 完了。 次に起動する Web UI / 月次バッチから新イメージ (:latest) が使われます。"
+          echo "※ 常駐サービスは無いため、 今動いているタスクはそのまま (自動停止後の次回起動で切り替わる)。"

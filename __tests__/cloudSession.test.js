@@ -62,3 +62,31 @@ test("loadSessionState / saveSessionState: S3 を差し替えて往復できる�
   store.set(SESSION_KEY, "{broken");
   assert.strictEqual(await loadSessionState(env, fakeS3), null);
 });
+
+const { shouldExitForIdle, isUserActivity } = require("../src/cloudSession");
+const MIN = 60 * 1000;
+
+test("shouldExitForIdle: 無操作が指定分数を超えたら true", () => {
+  assert.strictEqual(shouldExitForIdle({ lastActivityAt: 0, now: 60 * MIN, idleMinutes: 60, status: "idle" }), true);
+  assert.strictEqual(shouldExitForIdle({ lastActivityAt: 0, now: 59 * MIN, idleMinutes: 60, status: "idle" }), false);
+});
+
+test("shouldExitForIdle: 書き込み中・起動中は止めない", () => {
+  assert.strictEqual(shouldExitForIdle({ lastActivityAt: 0, now: 999 * MIN, idleMinutes: 60, status: "writing" }), false);
+  assert.strictEqual(shouldExitForIdle({ lastActivityAt: 0, now: 999 * MIN, idleMinutes: 60, status: "launching" }), false);
+  assert.strictEqual(shouldExitForIdle({ lastActivityAt: 0, now: 999 * MIN, idleMinutes: 60, status: "ready" }), true);
+});
+
+test("shouldExitForIdle: 0 以下・不正なら無効", () => {
+  assert.strictEqual(shouldExitForIdle({ lastActivityAt: 0, now: 999 * MIN, idleMinutes: 0, status: "idle" }), false);
+  assert.strictEqual(shouldExitForIdle({ lastActivityAt: 0, now: 999 * MIN, idleMinutes: "x", status: "idle" }), false);
+});
+
+test("isUserActivity: ポーリングとヘルスチェックは操作に数えない", () => {
+  assert.strictEqual(isUserActivity("GET", "/api/status"), false);
+  assert.strictEqual(isUserActivity("GET", "/healthz"), false);
+  assert.strictEqual(isUserActivity("GET", "/"), true);
+  assert.strictEqual(isUserActivity("POST", "/api/start"), true);
+  assert.strictEqual(isUserActivity("POST", "/api/remote/click"), true);
+  assert.strictEqual(isUserActivity("GET", "/api/screenshot"), true);
+});

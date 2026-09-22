@@ -27,9 +27,7 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh && mkdir -p /data/profile /app/output
 
 EXPOSE 4545
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-  CMD curl -fsS http://localhost:4545/healthz || exit 1
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-# 既定は Web UI。 月次バッチは Scheduler 側で command を上書きする: ["node","src/runScheduled.js","--auto"]
+# 既定は Web UI。 月次バッチ用タスク定義は command を ["node","src/runScheduled.js","--auto"] にしている
 CMD ["node", "src/webServer.js"]

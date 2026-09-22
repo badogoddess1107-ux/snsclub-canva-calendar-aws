@@ -109,8 +109,29 @@ function isAllowedKey(key) {
   return ALLOWED_KEYS.has(String(key));
 }
 
+/**
+ * 無操作で自動停止すべきか（純粋関数）。
+ * AWS では「使う時だけ起動」するため、 誰も操作しなくなったらプロセスを終了して課金を止める。
+ * 書き込み中は絶対に止めない。 idleMinutes が 0 以下なら無効。
+ */
+function shouldExitForIdle({ lastActivityAt, now, idleMinutes, status }) {
+  const mins = Number(idleMinutes);
+  if (!Number.isFinite(mins) || mins <= 0) return false;
+  if (status === "writing" || status === "launching") return false;
+  return now - lastActivityAt >= mins * 60 * 1000;
+}
+
+/** 操作としてカウントするリクエストか（status ポーリングやヘルスチェックは含めない） */
+function isUserActivity(method, pathname) {
+  if (pathname === "/healthz" || pathname === "/api/status") return false;
+  if (method === "POST") return true;
+  return pathname === "/" || pathname === "/api/screenshot";
+}
+
 module.exports = {
   SESSION_KEY,
+  shouldExitForIdle,
+  isUserActivity,
   sessionEnabled,
   makeS3,
   loadSessionState,

@@ -38,6 +38,9 @@ const SESSION_TOKEN = crypto.randomBytes(16).toString("hex");
 // 未指定なら従来通り (Mac 上の .browser-profile)。
 const PROFILE_DIR = process.env.CANVA_PROFILE_DIR || path.join(__dirname, "..", config.canva.userDataDir);
 const CLOUD_MODE = cloud.sessionEnabled();
+// AWS では「使う時だけ起動」。 この分数だけ誰も操作しなければ自分で終了して課金を止める (0 で無効)
+const IDLE_EXIT_MINUTES = parseInt(process.env.CANVA_IDLE_EXIT_MINUTES || "0", 10);
+let lastActivityAt = Date.now();
 
 // ============================================================
 // サーバー状態 (単一セッション)
@@ -626,8 +629,16 @@ async function poll(){
     // 書込み中はスクショ自動更新
     if(r.status==='writing' && !shotTimer){ shotTimer=setInterval(refreshShot,2000); }
     if(r.status!=='writing' && shotTimer){ clearInterval(shotTimer); shotTimer=null; }
-  }catch(e){}
+    pollFail=0;
+  }catch(e){
+    // 数回続けて届かない = サーバー停止 (AWSの自動停止など)
+    if(++pollFail>=5){
+      document.getElementById('status').textContent='⚫ サーバーが停止しています (無操作で自動停止した可能性)。 ${process.env.CANVA_START_PAGE_URL ? "起動ページから再起動してください。" : "再起動してください。"}';
+      ${process.env.CANVA_START_PAGE_URL ? `document.getElementById('session').innerHTML='<a href="${process.env.CANVA_START_PAGE_URL}" style="color:#60a5fa">▶ 起動ページを開く</a>';` : ""}
+    }
+  }
 }
+let pollFail=0;
 function statusEmoji(s){return ({idle:'⚪',launching:'🟡',ready:'🟢',writing:'🔵',done:'✅',error:'🔴'})[s]||'⚪';}
 statusTimer=setInterval(poll,1000); poll();
 </script>
@@ -667,6 +678,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 認証済ルート
+  if (cloud.isUserActivity(req.method, p)) lastActivityAt = Date.now();
   try {
     if (p === "/" && req.method === "GET") {
       return sendHTML(res, 200, controlPage());
@@ -773,3 +785,14 @@ process.on("SIGTERM", async () => {
   try { await actionClose(); } catch {}
   process.exit(0);
 });
+
+// 無操作が続いたら自分で終了する (AWS の「使う時だけ起動」用)。 書き込み中は止めない。
+if (IDLE_EXIT_MINUTES > 0) {
+  console.log(`  自動停止:     ${IDLE_EXIT_MINUTES}分間 無操作で終了します`);
+  setInterval(async () => {
+    if (!cloud.shouldExitForIdle({ lastActivityAt, now: Date.now(), idleMinutes: IDLE_EXIT_MINUTES, status: state.status })) return;
+    console.log(`⏹ ${IDLE_EXIT_MINUTES}分間 操作が無かったため自動停止します`);
+    try { await actionClose(); } catch {}
+    process.exit(0);
+  }, 60 * 1000);
+}
