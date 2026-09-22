@@ -1,0 +1,371 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  SnsClub Canva カレンダー自動化（Web UI + 月次バッチ）を AWS Fargate で動かす。
+  田畑のMacに依存しない。 Web UI は ALB 経由、 月次バッチは EventBridge Scheduler が RunTask する。
+
+# ============================================================
+# 構成
+#   ALB (HTTPS) ──► Fargate Service (Web UI: webServer.js, Xvfb + Chromium)
+#   EventBridge Scheduler (毎月25日 9:00 JST) ──► Fargate RunTask (runScheduled.js --auto)
+#   S3 SessionBucket: Canva のログイン状態 (Cookie) を Web UI と バッチで共有
+#   ECR: GitHub Actions がイメージを push する
+# ============================================================
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: snsclub-canva-calendar
+    Description: リソース名の接頭辞
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: 起動する ECR イメージのタグ（GitHub Actions が latest を push する）
+  WebPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Web UI のログインパスワード（スタッフに共有するもの）
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM 証明書 ARN（HTTPS 用。空なら HTTP のみ＝検証用途）
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Web UI にアクセスできる送信元（社内固定IPがあれば絞る）
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 1
+    Description: Web UI の常時稼働数。初回はイメージが無いので 0。イメージ push 後に 1 にする。使わない期間は 0 にして節約可
+  TaskCpu:
+    Type: String
+    Default: '2048'
+    AllowedValues: ['1024', '2048', '4096']
+  TaskMemory:
+    Type: String
+    Default: '4096'
+    AllowedValues: ['2048', '4096', '8192']
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 9 25 * ? *)
+    Description: 月次バッチの実行時刻（Asia/Tokyo）。既定は毎月25日 9:00
+  ScheduleEnabled:
+    Type: String
+    Default: 'ENABLED'
+    AllowedValues: ['ENABLED', 'DISABLED']
+  CanvaDesignUrl:
+    Type: String
+    Default: ''
+    Description: 省略時は config.js の designUrl を使う
+  DiscordNotifyWebhookUrl:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: 月次バッチの成否を通知する Discord Webhook（空なら通知しない）
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  HasDesignUrl: !Not [!Equals [!Ref CanvaDesignUrl, '']]
+
+Resources:
+  # ------------------------------------------------------------
+  # ネットワーク（自己完結の小さな VPC。パブリックサブネット×2）
+  # ------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref ProjectName }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  SubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} ALB'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref AllowedCidr }
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} tasks'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 4545, ToPort: 4545, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+
+  # ------------------------------------------------------------
+  # 保存先・イメージ・ログ
+  # ------------------------------------------------------------
+  SessionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }   # ログイン状態を誤って上書きしても戻せる
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"keep last 10","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: 90
+
+  # ------------------------------------------------------------
+  # IAM
+  # ------------------------------------------------------------
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: session-bucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource: [!GetAtt SessionBucket.Arn, !Sub '${SessionBucket.Arn}/*']
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: scheduler.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: run-task
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Ref TaskDefinition
+                Condition: { ArnLike: { 'ecs:cluster': !GetAtt Cluster.Arn } }
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt TaskExecutionRole.Arn, !GetAtt TaskRole.Arn]
+
+  # ------------------------------------------------------------
+  # ECS
+  # ------------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ProjectName
+      ClusterSettings: [{ Name: containerInsights, Value: disabled }]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ProjectName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      EphemeralStorage: { SizeInGiB: 30 }
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:${ImageTag}'
+          Essential: true
+          PortMappings: [{ ContainerPort: 4545, Protocol: tcp }]
+          Environment:
+            - { Name: CANVA_WEB_PORT, Value: '4545' }
+            - { Name: CANVA_WEB_PASSWORD, Value: !Ref WebPassword }
+            - { Name: CANVA_SESSION_BUCKET, Value: !Ref SessionBucket }
+            - { Name: CANVA_PROFILE_DIR, Value: /data/profile }
+            - { Name: CANVA_DESIGN_URL, Value: !If [HasDesignUrl, !Ref CanvaDesignUrl, ''] }
+            - { Name: TZ, Value: Asia/Tokyo }
+            - { Name: DISCORD_NOTIFY_WEBHOOK_URL, Value: !Ref DiscordNotifyWebhookUrl }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  # ---- Web UI（常駐サービス。DesiredCount=0 で停止して節約可）----
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: '120' }   # 起動(Chromium)が数十秒かかるため
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 4545
+      TargetType: ip
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+        - { Key: stickiness.enabled, Value: 'false' }
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig: { Protocol: HTTPS, Port: '443', StatusCode: HTTP_301 }
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates: [{ CertificateArn: !Ref CertificateArn }]
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-web'
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 120
+      # ブラウザセッションは1つだけにする（同時に2タスク動かない）
+      DeploymentConfiguration: { MinimumHealthyPercent: 0, MaximumPercent: 100 }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: app, ContainerPort: 4545, TargetGroupArn: !Ref TargetGroup }
+
+  # ---- 月次バッチ（毎月25日 9:00 JST に 1 タスク起動。終わったら消える）----
+  MonthlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-monthly'
+      Description: Canva カレンダー翌月分の自動書き込み
+      State: !Ref ScheduleEnabled
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: Asia/Tokyo
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      Target:
+        Arn: !GetAtt Cluster.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy: { MaximumRetryAttempts: 0 }   # 二重書き込み防止
+        EcsParameters:
+          TaskDefinitionArn: !Ref TaskDefinition
+          LaunchType: FARGATE
+          TaskCount: 1
+          NetworkConfiguration:
+            AwsvpcConfiguration:
+              AssignPublicIp: ENABLED
+              Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+              SecurityGroups: [!Ref TaskSecurityGroup]
+        Input: '{"containerOverrides":[{"name":"app","command":["node","src/runScheduled.js","--auto"]}]}'
+
+Outputs:
+  WebUrl:
+    Description: Web UI の URL（HTTPS は CertificateArn を設定し、DNS でこのALBを指す）
+    Value: !If
+      - HasCertificate
+      - !Sub 'https://${LoadBalancer.DNSName}/'
+      - !Sub 'http://${LoadBalancer.DNSName}/'
+  LoadBalancerDnsName:
+    Description: 独自ドメインを使う場合、この DNS 名を CNAME/ALIAS に設定
+    Value: !GetAtt LoadBalancer.DNSName
+  EcrRepositoryUri:
+    Description: GitHub Actions の push 先
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}'
+  SessionBucketName:
+    Description: Canva ログイン状態の保存先（scripts/canva-session-login.js の --bucket）
+    Value: !Ref SessionBucket
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TaskDefinitionArn:
+    Description: 手動で月次バッチを動かすときに RunTask で指定
+    Value: !Ref TaskDefinition
+  SubnetIds:
+    Description: 手動 RunTask 用
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+  TaskSecurityGroupId:
+    Value: !Ref TaskSecurityGroup

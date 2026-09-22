@@ -1,0 +1,8 @@
+node_modules/
+.browser-profile/
+.browser-profile-scheduled/
+output/
+.env
+.DS_Store
+*.log
+canva-session.json
