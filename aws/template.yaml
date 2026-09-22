@@ -216,6 +216,32 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
         - !Ref RunTaskPolicy
 
+  # GitHub Actions が ECR に push するための IAM ユーザー（権限は ECR push のみ）。
+  # アクセスキーは担当者が発行して田畑へ渡す:
+  #   aws iam create-access-key --user-name snsclub-canva-calendar-github-actions
+  GithubDeployUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub '${ProjectName}-github-actions'
+      Policies:
+        - PolicyName: ecr-push-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt EcrRepository.Arn
+
   # ------------------------------------------------------------
   # ECS
   # ------------------------------------------------------------
@@ -404,6 +430,15 @@ Outputs:
   EcrRepositoryUri:
     Description: GitHub Actions の push 先
     Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}'
+  GithubDeployUserName:
+    Description: GitHub Actions 用 IAM ユーザー。担当者はこのユーザーのアクセスキーを発行して渡す
+    Value: !Ref GithubDeployUser
+  GithubDeployKeyCommand:
+    Description: アクセスキー発行コマンド（出力の AccessKeyId / SecretAccessKey を田畑へ安全に渡す）
+    Value: !Sub 'aws iam create-access-key --user-name ${GithubDeployUser}'
+  Region:
+    Description: GitHub Secrets の AWS_REGION に設定する値
+    Value: !Ref AWS::Region
   SessionBucketName:
     Description: Canva ログイン状態の保存先（scripts/canva-session-login.js の --bucket）
     Value: !Ref SessionBucket

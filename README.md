@@ -47,19 +47,16 @@ aws/template.yaml     CloudFormation（VPC, ECS, ECR, S3, Scheduler, 起動ペ�
 .github/workflows/deploy.yml     main へ push → ECR
 ```
 
-## デプロイ（担当者）
+## デプロイ
 
-### 0. 用意するもの
-- AWS CLI（認証済み）／GitHub リポジトリの Secrets を設定できる権限
-- ngrok の **Authtoken** と **固定ドメイン**（ダッシュボード → Your Authtoken / Domains）。
-  Mac で使っていた canva 用アカウント（`syrup-figment-submitter.ngrok-free.dev`）をそのまま使える
+役割分担: **担当者は「1. スタック作成」だけ**。以降は田畑が行う。
 
-### 1. CloudFormation スタックを作る
+### 1. スタック作成（担当者・AWS権限が必要）
 ```bash
 aws cloudformation deploy \
   --stack-name snsclub-canva-calendar \
   --template-file aws/template.yaml \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     WebPassword='Web UI のパスワード' \
     StartPageKey='起動ページのパスワード' \
@@ -67,22 +64,25 @@ aws cloudformation deploy \
     NgrokDomain='syrup-figment-submitter.ngrok-free.dev' \
     DiscordNotifyWebhookUrl='https://discord.com/api/webhooks/...'   # 任意
 ```
-出力（`aws cloudformation describe-stacks --stack-name snsclub-canva-calendar --query 'Stacks[0].Outputs'`）:
-- `StartPageUrl` … スタッフに配る「起動ページ」の URL
-- `WebUrl` … 起動後に開く Web UI の URL（ngrok 固定ドメイン）
-- `SessionBucketName` … ログイン状態の保存先
-- `EcrRepositoryUri` … GitHub Actions の push 先
+完了したら、以下2つを田畑へ渡す:
+```bash
+# (a) スタックの出力一覧（StartPageUrl / SessionBucketName / Region など）
+aws cloudformation describe-stacks --stack-name snsclub-canva-calendar --query 'Stacks[0].Outputs' --output table
+# (b) GitHub Actions 用のアクセスキー（ECR push 権限のみのユーザー。スタックが作成済み）
+aws iam create-access-key --user-name snsclub-canva-calendar-github-actions
+```
+(b) の `AccessKeyId` / `SecretAccessKey` はチャットに貼らず、安全な方法で渡す。
 
-### 2. GitHub Secrets を設定して push
-リポジトリの Settings → Secrets and variables → Actions:
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`（ECR に push できる IAM ユーザー）
-- `AWS_REGION`（例 `ap-northeast-1`）
+### 2. イメージを push（田畑・GitHub の権限で）
+リポジトリの Settings → Secrets and variables → Actions → New repository secret:
+- `AWS_ACCESS_KEY_ID` … (b) の AccessKeyId
+- `AWS_SECRET_ACCESS_KEY` … (b) の SecretAccessKey
+- `AWS_REGION` … (a) の Region（例 `ap-northeast-1`）
 
-`main` に push すると `.github/workflows/deploy.yml` が テスト → build → ECR push を行う。
-手動で走らせる場合は Actions タブの「deploy」→ Run workflow。
+→ Actions タブ →「deploy」→ Run workflow。5分ほどで ECR にイメージが入る（以後は main への push でも自動）。
 
-### 3. 起動して Canva にログイン（初回・ログイン切れ時）
-1. `StartPageUrl` を開き、`StartPageKey` を入れて「🚀 起動する」
+### 3. 起動して Canva にログイン（田畑）
+1. (a) の `StartPageUrl` を開き、`StartPageKey` を入れて「🚀 起動する」
 2. 2〜3分後に `WebUrl` を開く（初回は ngrok の警告ページで「Visit Site」）→ `WebPassword` でログイン
 3. 「🔑 Canvaログイン」→「ログイン画面を開く」→ スクショをクリック／文字を入力して Canva にログイン
 4. ホーム画面になったら「💾 ログイン状態を保存」。これで月次バッチも同じログインで動く
@@ -93,7 +93,7 @@ npm install && npx playwright install chromium
 npm run session:login -- --bucket <SessionBucketName>
 ```
 
-### 4. 月次バッチの動作確認（本番 Canva に書き込むので、使っていないページで）
+### 4. 月次バッチの動作確認（田畑。本番 Canva に書き込むので、使っていないページで）
 ```bash
 aws ecs run-task --cluster snsclub-canva-calendar --launch-type FARGATE \
   --task-definition <BatchTaskDefinitionArn> \
@@ -101,8 +101,9 @@ aws ecs run-task --cluster snsclub-canva-calendar --launch-type FARGATE \
   --overrides '{"containerOverrides":[{"name":"app","command":["node","src/runScheduled.js","--auto","--target=2026-11","--page=40"]}]}'
 ```
 ログは CloudWatch Logs `/ecs/snsclub-canva-calendar`。`--page` は使っていないページ番号を指定する。
+（AWS CLI が無ければ担当者に依頼。または起動ページから Web UI を起動し、Web UI から書き込んでも同じ検証になる）
 
-### 5. Mac 側の停止（AWS で問題なく動いたら）
+### 5. Mac 側の停止（AWS で問題なく動いたら・田畑）
 ```bash
 launchctl bootout gui/$(id -u)/com.user.ngrok-canva          # ngrok（同じアカウントなら必須。1接続制限）
 launchctl bootout gui/$(id -u)/com.tabata.canva-webserver    # Web UI
