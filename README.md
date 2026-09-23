@@ -11,7 +11,7 @@ Google カレンダー → Canva の月間カレンダーテンプレへ自動�
                                                   ▼
                                                 Canva（ログイン状態は S3 から復元）
 EventBridge Scheduler（毎月25日 9:00 JST）──► Fargate タスク [月次バッチ]（数十分で終了）
-GitHub Actions（main に push）──► Docker build ──► ECR
+担当者が手元で Docker build ──► ECR（GitHub Actions は社内方針により不使用）
 ```
 
 ## 費用（東京リージョン・概算）
@@ -44,7 +44,7 @@ scripts/canva-session-login.js   手元PCで Canva にログインして S3 に�
 scripts/docker-entrypoint.sh     Xvfb 上でコマンドを起動
 Dockerfile / .dockerignore
 aws/template.yaml     CloudFormation（VPC, ECS, ECR, S3, Scheduler, 起動ページ Lambda, IAM）
-.github/workflows/deploy.yml     main へ push → ECR
+.github/workflows/deploy.yml     自動実行は無効（社内方針により GitHub Actions 不使用）
 ```
 
 ## デプロイ
@@ -73,15 +73,25 @@ aws iam create-access-key --user-name snsclub-canva-calendar-github-actions
 ```
 (b) の `AccessKeyId` / `SecretAccessKey` はチャットに貼らず、安全な方法で渡す。
 
-### 2. イメージを push（田畑・GitHub の権限で）
-リポジトリの Settings → Secrets and variables → Actions → New repository secret:
-- `AWS_ACCESS_KEY_ID` … (b) の AccessKeyId
-- `AWS_SECRET_ACCESS_KEY` … (b) の SecretAccessKey
-- `AWS_REGION` … (a) の Region（例 `ap-northeast-1`）
+### 2. イメージのビルドと push（担当者）
+社内方針により GitHub Actions は使わない。担当者が手元で build して ECR に push する。
+```bash
+aws ecr get-login-password --region <Region> | docker login --username AWS --password-stdin <EcrRepositoryUri>
+docker build -t <EcrRepositoryUri>:latest .
+docker push <EcrRepositoryUri>:latest
+```
+Web UI / 月次バッチは起動のたびに `:latest` を引くため、**次回の起動から新しいイメージになる**
+（起動中のタスクは入れ替わらない。急ぐ場合は `aws ecs stop-task` で止めてから起動し直す）。
 
-→ Actions タブ →「deploy」→ Run workflow。5分ほどで ECR にイメージが入る（以後は main への push でも自動）。
+> コード修正時は、田畑が main に push → 担当者に「イメージ更新をお願いします」と連絡する運用。
+> `.github/workflows/deploy.yml` は自動実行を無効化してある（方針が変われば使える状態で残置）。
 
 ### 3. 起動して Canva にログイン（田畑）
+
+> **先に Mac 側の ngrok を止めること。** ngrok 無料プランは 1 アカウント 1 接続のため、
+> Mac が同じドメインを掴んだままだと AWS 側の ngrok が繋がらず、URL を開いても Mac に届いてしまう。
+> `launchctl bootout gui/$(id -u)/com.user.ngrok-canva`
+
 1. (a) の `StartPageUrl` を開き、`StartPageKey` を入れて「🚀 起動する」
 2. 2〜3分後に `WebUrl` を開く（初回は ngrok の警告ページで「Visit Site」）→ `WebPassword` でログイン
 3. 「🔑 Canvaログイン」→「ログイン画面を開く」→ スクショをクリック／文字を入力して Canva にログイン

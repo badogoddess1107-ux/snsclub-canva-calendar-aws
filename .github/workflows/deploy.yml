@@ -15,10 +15,9 @@
 # このワークフローを走らせる (順序が逆だと push 先が無い)。
 name: deploy
 
+# 社内方針により GitHub Actions は使わないため、自動実行(push)は無効。
+# 方針が変わった場合に備えて、手動実行(workflow_dispatch)だけ残してある。
 on:
-  push:
-    branches: [main]
-    paths-ignore: ['**.md']
   workflow_dispatch:
 
 env:
