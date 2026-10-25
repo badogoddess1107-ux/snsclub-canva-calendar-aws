@@ -43,7 +43,7 @@ src/canvaCore.js ほか Canva 操作の中核（Mac 時代から共通）
 scripts/canva-session-login.js   手元PCで Canva にログインして S3 に保存
 scripts/docker-entrypoint.sh     Xvfb 上でコマンドを起動
 Dockerfile / .dockerignore
-aws/template.yaml     CloudFormation（VPC, ECS, ECR, S3, Scheduler, 起動ページ Lambda, IAM）
+aws/template.yaml     CloudFormation（ECS, ECR, S3, Scheduler, 起動ページ Lambda, IAM。VPC は既存のものを使う）
 .github/workflows/deploy.yml     自動実行は無効（社内方針により GitHub Actions 不使用）
 ```
 
@@ -58,11 +58,19 @@ aws cloudformation deploy \
   --template-file aws/template.yaml \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --parameter-overrides \
+    VpcId='vpc-xxxxxxxx' \
+    SubnetIds='subnet-aaaa,subnet-bbbb' \
     WebPassword='Web UI のパスワード' \
     StartPageKey='起動ページのパスワード' \
     NgrokAuthtoken='ngrok の Authtoken' \
     NgrokDomain='syrup-figment-submitter.ngrok-free.dev' \
     DiscordNotifyWebhookUrl='https://discord.com/api/webhooks/...'   # 任意
+```
+`VpcId` / `SubnetIds` は既存VPC（既定VPCでよい）とそのパブリックサブネット2つ以上。VPC を新しく作らないのは、アカウントの VPC/IGW 上限でスタック作成が失敗するため。
+```bash
+# 既定VPCとサブネットの確認
+aws ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text
+aws ec2 describe-subnets --filters Name=vpc-id,Values=<VpcId> --query 'Subnets[].SubnetId' --output text
 ```
 完了したら、以下2つを田畑へ渡す:
 ```bash
