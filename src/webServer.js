@@ -764,7 +764,8 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("📅 Canva 書込み Web コントロール 起動");
   console.log("============================================================");
   console.log(`  ローカル:     http://localhost:${PORT}`);
-  console.log(`  パスワード:   ${PASSWORD}`);
+  // 環境変数で渡したパスワードはログ（CloudWatch Logs など）に残さない
+  console.log(`  パスワード:   ${process.env.CANVA_WEB_PASSWORD ? "(CANVA_WEB_PASSWORD で設定済み)" : PASSWORD}`);
   if (!process.env.CANVA_WEB_PASSWORD) {
     console.log("  ※ パスワードは自動生成。 固定したい場合は CANVA_WEB_PASSWORD=xxx で起動");
   }
