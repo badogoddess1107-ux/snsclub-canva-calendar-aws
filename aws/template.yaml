@@ -9,11 +9,22 @@ Description: >-
 #        スタッフはここでパスワードを入れて「起動」→ 2分後に ngrok の固定URLを開く
 #        Web UI は CANVA_IDLE_EXIT_MINUTES 分 無操作なら自分で終了（＝課金停止）
 #   EventBridge Scheduler (毎月25日 9:00 JST) ──► RunTask ──► Fargate Task [app のみ] runScheduled.js --auto
+#   ネットワーク: 既存VPCのパブリックサブネットを使う（VPC/IGW の上限に当たらないよう新規作成しない）
 #   S3 SessionBucket: Canva のログイン状態 (Cookie) を Web UI と バッチで共有
 #   ECR: GitHub Actions がイメージを push（RunTask は毎回 :latest を引く）
 # ============================================================
 
 Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >-
+      Fargate タスクを置く既存VPC。新しく VPC を作らない（アカウントの VPC/IGW 上限に当たるため）。
+      既定VPC (172.31.0.0/16) でよい
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      上記VPCのパブリックサブネット（2つ以上。条件: 0.0.0.0/0 が
+      インターネットゲートウェイに向いていること。タスクはパブリックIPで外へ出る）
   ProjectName:
     Type: String
     Default: snsclub-canva-calendar
@@ -73,56 +84,14 @@ Conditions:
 
 Resources:
   # ------------------------------------------------------------
-  # ネットワーク（無料。パブリックサブネット×2、NAT 無し = 固定費なし）
+  # ネットワーク（既存VPCを使う。VPC/IGW/サブネットはこのスタックでは作らない）
   # ------------------------------------------------------------
-  Vpc:
-    Type: AWS::EC2::VPC
-    Properties:
-      CidrBlock: 10.42.0.0/16
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
-      Tags: [{ Key: Name, Value: !Ref ProjectName }]
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-  VpcGatewayAttachment:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
-  PublicSubnetA:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref Vpc
-      CidrBlock: 10.42.0.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: true
-  PublicSubnetB:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref Vpc
-      CidrBlock: 10.42.1.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-      MapPublicIpOnLaunch: true
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties: { VpcId: !Ref Vpc }
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: VpcGatewayAttachment
-    Properties:
-      RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-  SubnetARouteAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
-  SubnetBRouteAssoc:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
   # 受信ポートは開けない。外からの入口は ngrok（コンテナから外向きに接続）だけ
   TaskSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: !Sub '${ProjectName} tasks (outbound only)'
-      VpcId: !Ref Vpc
+      VpcId: !Ref VpcId
 
   # ------------------------------------------------------------
   # 保存先・イメージ・ログ
@@ -267,6 +236,8 @@ Resources:
         - Name: app
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:${ImageTag}'
           Essential: true          # app が終了(自動停止)したらタスク全体が止まる
+          # xvfb-run を PID 1 にしない（PID 1 だと SIGUSR1 待ちで永久停止し node が起動しない）
+          LinuxParameters: { InitProcessEnabled: true }
           Environment:
             - { Name: CANVA_WEB_PORT, Value: '4545' }
             - { Name: CANVA_WEB_PASSWORD, Value: !Ref WebPassword }
@@ -312,6 +283,8 @@ Resources:
         - Name: app
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:${ImageTag}'
           Essential: true
+          # xvfb-run を PID 1 にしない（PID 1 だと SIGUSR1 待ちで永久停止し node が起動しない）
+          LinuxParameters: { InitProcessEnabled: true }
           Command: ['node', 'src/runScheduled.js', '--auto']
           Environment:
             - { Name: CANVA_SESSION_BUCKET, Value: !Ref SessionBucket }
@@ -347,7 +320,7 @@ Resources:
           NetworkConfiguration:
             AwsvpcConfiguration:
               AssignPublicIp: ENABLED
-              Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+              Subnets: !Ref SubnetIds
               SecurityGroups: [!Ref TaskSecurityGroup]
 
   # ------------------------------------------------------------
@@ -365,7 +338,7 @@ Resources:
         Variables:
           CLUSTER: !Ref Cluster
           TASK_DEF: !Sub '${ProjectName}-web'   # family 名 (最新リビジョンが使われる)
-          SUBNETS: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+          SUBNETS: !Join [',', !Ref SubnetIds]
           SECURITY_GROUP: !Ref TaskSecurityGroup
           WEB_URL: !Sub 'https://${NgrokDomain}/'
           START_KEY: !Ref StartPageKey
@@ -419,6 +392,15 @@ Resources:
       Action: lambda:InvokeFunctionUrl
       Principal: '*'
       FunctionUrlAuthType: NONE
+  # AuthType NONE の Function URL は InvokeFunctionUrl だけだと 403 になる。
+  # lambda:InvokeFunction も Function URL 経由に限って許可する
+  StartFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
 
 Outputs:
   StartPageUrl:
@@ -448,6 +430,6 @@ Outputs:
     Description: 手動で月次バッチを動かすときに RunTask で指定
     Value: !Ref BatchTaskDefinition
   SubnetIds:
-    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Value: !Join [',', !Ref SubnetIds]
   TaskSecurityGroupId:
     Value: !Ref TaskSecurityGroup
