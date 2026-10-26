@@ -237,22 +237,6 @@ async function actionStart(pageNumber, month) {
   await persistCloudSession("起動");
 }
 
-async function actionNav(dir) {
-  if (!state.page) throw new Error("未起動です。");
-  if (dir === "next") await core.pageDown(state.page);
-  else if (dir === "prev") await core.pageUp(state.page);
-  else if (dir === "top") await core.pageTop(state.page);
-  else throw new Error("不明な方向: " + dir);
-}
-
-async function actionGoto(targetPage) {
-  if (!state.page) throw new Error("未起動です。");
-  if (!targetPage || targetPage < 1) throw new Error("ページ番号が不正です。");
-  pushLog(`📑 ${targetPage}ページへ移動中 (scrollIntoView)...`);
-  const nav = await core.gotoPageByScroll(state.page, targetPage);
-  pushLog(`   ✓ ${targetPage}ページへ移動 (総ページ数=${nav.total})。 画面で確認してください。`);
-}
-
 async function actionWrite(reqPage, reqMonth) {
   if (!state.page) throw new Error("未起動です。");
   if (state.status === "writing") throw new Error("既に書込み中です。");
@@ -482,77 +466,56 @@ function controlPage() {
   .blue{background:#3b82f6}.gray{background:#475569}.green{background:#22c55e}.red{background:#ef4444}
   button:disabled{opacity:.4;cursor:not-allowed}
   #status{padding:10px 14px;border-radius:8px;background:#334155;font-weight:bold;margin-bottom:14px}
-  #shot{width:100%;border-radius:8px;border:1px solid #334155;background:#000;min-height:200px}
+  #shot{width:100%;display:block;border-radius:8px;border:1px solid #334155;background:#000}
+  #shotEmpty{width:100%;min-height:360px;border-radius:8px;border:1px dashed #334155;color:#64748b;font-size:13px;display:flex;align-items:center;justify-content:center}
   #log{background:#0f172a;border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap;max-height:280px;overflow:auto;border:1px solid #334155}
   .nav{display:flex;gap:8px;justify-content:center;margin:10px 0}
   .row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
-  details{margin-top:8px}summary{cursor:pointer;color:#94a3b8;font-size:13px}
+  details summary{cursor:pointer;color:#94a3b8;font-size:14px;padding:2px 0}
+  #log:empty{display:none}
   .day{font-size:12px;border-bottom:1px solid #334155;padding:4px 0}
   .warn{color:#fbbf24;font-size:12px}
 </style></head><body>
-<h1>📅 Canva カレンダー書込みコントロール</h1>
+<h1>📅 Canva カレンダー</h1>
 <div id="status">読込中...</div>
-<div id="session" style="font-size:13px;color:#94a3b8;margin:-8px 0 14px 4px">未起動</div>
+<div id="session" style="font-size:13px;color:#94a3b8;margin:-8px 0 14px 4px;display:none"></div>
 
 <div class="card">
-  <h2>① 起動</h2>
   <div class="row">
     <div><label>ページ番号</label><input id="page" type="number" value="${defaultPage}"></div>
     <div><label>月 (YYYY-MM)</label><input id="month" type="text" value="${defaultMonth}" style="width:140px"></div>
     <button class="blue" id="btnStart" onclick="start()">🚀 起動</button>
+    <button class="green" id="btnWrite" onclick="doWrite()">✅ 書き込み実行</button>
     <button class="gray" id="btnClose" onclick="closeBrowser()">閉じる</button>
   </div>
-  <div class="warn">${CLOUD_MODE
-    ? "※ AWS上のブラウザでCanvaを開きます。 ログイン状態はS3に保存されたものを使います。"
-    : "※ あなたのMacでCanvaがログイン済の状態で起動します。"}</div>
+</div>
+
+<div class="card">
+  <div id="shotEmpty">起動するとCanva画面が表示されます</div>
+  <img id="shot" style="display:none" ${CLOUD_MODE ? 'onclick="shotClick(event)" style="cursor:crosshair"' : ""}>
+  <div class="nav"><button class="gray" onclick="refreshShot()">🔄 画面更新</button></div>
+</div>
+
+<div class="card">
+  <details><summary id="previewSummary">書込み対象の日一覧</summary><div id="preview"></div></details>
+  <div id="log"></div>
 </div>
 
 ${CLOUD_MODE ? `
-<div class="card">
-  <h2>🔑 Canvaログイン (初回・ログイン切れのときだけ)</h2>
-  <div class="warn">AWS上のブラウザには画面が無いので、 下のスクショをクリック・文字入力して人がログインします。 完了したら「ログイン状態を保存」。</div>
+<details class="card" id="loginCard">
+  <summary>🔑 Canvaログイン（初回・ログイン切れのときだけ）</summary>
+  <div class="warn" style="margin:10px 0">上のCanva画面をクリック／下の欄で文字入力してログインし、 完了したら「ログイン状態を保存」。</div>
   <div class="nav">
     <button class="blue" onclick="loginLaunch()">🔑 ログイン画面を開く</button>
     <button class="green" onclick="saveSession()">💾 ログイン状態を保存</button>
   </div>
-  <div class="row" style="margin-top:6px">
-    <input id="rtext" type="text" placeholder="入力する文字 (メール等)" style="width:260px">
+  <div class="row">
+    <input id="rtext" type="text" placeholder="入力する文字 (メール等)" style="width:240px">
     <button class="gray" onclick="remoteType()">⌨️ 入力</button>
     <button class="gray" onclick="remoteKey('Enter')">Enter</button>
-    <button class="gray" onclick="remoteKey('Tab')">Tab</button>
     <button class="gray" onclick="remoteKey('Backspace')">⌫</button>
-    <button class="gray" onclick="remoteKey('Escape')">Esc</button>
   </div>
-  <div class="warn" style="margin-top:6px">※ 下の「② ページ確認」のスクショをクリックすると、 その位置をブラウザでクリックします。</div>
-</div>` : ""}
-
-<div class="card">
-  <h2>② ページ確認 (任意)</h2>
-  <div class="warn">「④ 書き込み実行」で<b>自動で目的ページへ移動</b>します。 事前に見たい時だけ下を使用。</div>
-  <div class="nav">
-    <button class="blue" onclick="gotoPage()">📄 目的ページへ移動して確認</button>
-    <button class="gray" onclick="refreshShot()">🔄 画面更新</button>
-  </div>
-  <div class="nav">
-    <button class="gray" onclick="nav('top')">⏮ 先頭</button>
-    <button class="gray" onclick="nav('prev')">◀ 前へ</button>
-    <button class="gray" onclick="nav('next')">次へ ▶</button>
-  </div>
-  <img id="shot" src="" alt="(起動するとCanva画面が表示されます)" ${CLOUD_MODE ? 'onclick="shotClick(event)" style="cursor:crosshair"' : ""}>
-</div>
-
-<div class="card">
-  <h2>③ 書込み内容プレビュー</h2>
-  <details><summary id="previewSummary">書込み対象の日一覧を表示</summary><div id="preview"></div></details>
-</div>
-
-<div class="card">
-  <h2>④ 書き込み実行 (完全自動)</h2>
-  <div class="warn">このボタン1つで <b>自動で目的ページへ移動 → 書き込み</b> まで行います。</div>
-  <button class="green" id="btnWrite" onclick="doWrite()">✅ 自動でページ移動して書き込み実行</button>
-  <h2>進捗ログ</h2>
-  <div id="log"></div>
-</div>
+</details>` : ""}
 
 <script>
 let shotTimer=null, statusTimer=null;
@@ -569,16 +532,13 @@ async function start(){
   if(!r.ok) alert('起動失敗: '+r.error);
   setBusy(false); refreshShot();
 }
-async function closeBrowser(){ setBusy(true); await api('/api/close'); setBusy(false); document.getElementById('shot').src=''; }
-async function nav(dir){ setBusy(true); const r=await api('/api/nav',{dir}); if(!r.ok)alert(r.error); setBusy(false); setTimeout(refreshShot,700); }
-async function gotoPage(){
-  setBusy(true);
-  const page=parseInt(document.getElementById('page').value,10);
-  const r=await api('/api/goto',{page});
-  if(!r.ok)alert(r.error);
-  setBusy(false); setTimeout(refreshShot,800);
+async function closeBrowser(){ setBusy(true); await api('/api/close'); setBusy(false); document.getElementById('shot').style.display='none'; document.getElementById('shotEmpty').style.display='flex'; }
+function refreshShot(){
+  const img=document.getElementById('shot');
+  img.onload=()=>{ img.style.display='block'; document.getElementById('shotEmpty').style.display='none'; };
+  img.onerror=()=>{ img.style.display='none'; document.getElementById('shotEmpty').style.display='flex'; };
+  img.src='/api/screenshot?'+Date.now();
 }
-function refreshShot(){ document.getElementById('shot').src='/api/screenshot?'+Date.now(); }
 // ---- リモート操作 (AWSモードのみ) ----
 async function loginLaunch(){ setBusy(true); const r=await api('/api/login/launch'); if(!r.ok)alert(r.error); setBusy(false); setTimeout(refreshShot,800); }
 async function saveSession(){ setBusy(true); const r=await api('/api/session/save'); alert(r.ok?'保存しました。 月次バッチもこのログインで動きます。':'保存失敗: '+r.error); setBusy(false); }
@@ -612,17 +572,17 @@ async function poll(){
       const p=document.getElementById('page').value, m=document.getElementById('month').value;
       const diff=(String(r.session.page)!==String(p))||(r.session.month!==m);
       sess.textContent='起動中: '+r.session.page+'ページ / '+r.session.month
-        +(diff?'  ⚠️ 入力欄('+p+'ページ / '+m+')と違います → 書き込みは入力欄の方を使います':'');
+        +(diff?'  ⚠️ 上の入力欄('+p+' / '+m+')が優先されます':'');
       sess.style.color=diff?'#fbbf24':'#94a3b8';
+      sess.style.display='';
     } else {
-      sess.textContent='未起動';
-      sess.style.color='#94a3b8';
+      sess.style.display='none';
     }
     document.getElementById('log').textContent = r.log.join('\\n');
     document.getElementById('log').scrollTop = 9e9;
     // preview
     if(r.preview && r.preview.length){
-      document.getElementById('previewSummary').textContent = '書込み対象 '+r.preview.length+'日 (タップで展開)';
+      document.getElementById('previewSummary').textContent = '書込み対象 '+r.preview.length+'日';
       document.getElementById('preview').innerHTML = r.preview.map(d=>
         '<div class="day"><b>'+d.date+'日('+d.weekday+')</b> cell('+d.r+','+d.c+') : '+d.lines.join(' / ')+'</div>').join('');
     }
@@ -700,16 +660,6 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/start" && req.method === "POST") {
       const { page, month } = JSON.parse(await readBody(req) || "{}");
       await actionStart(parseInt(page, 10), month);
-      return sendJSON(res, 200, { ok: true });
-    }
-    if (p === "/api/nav" && req.method === "POST") {
-      const { dir } = JSON.parse(await readBody(req) || "{}");
-      await actionNav(dir);
-      return sendJSON(res, 200, { ok: true });
-    }
-    if (p === "/api/goto" && req.method === "POST") {
-      const { page } = JSON.parse(await readBody(req) || "{}");
-      await actionGoto(parseInt(page, 10));
       return sendJSON(res, 200, { ok: true });
     }
     if (p === "/api/write" && req.method === "POST") {
