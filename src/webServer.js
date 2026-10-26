@@ -200,8 +200,13 @@ async function actionLaunchForLogin() {
   state.status = "launching";
   state.statusMsg = "Chromium 起動中 (ログイン用)...";
   const { context, page } = await launchBrowser();
-  await page.goto("https://www.canva.com/login", { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(3000);
+  try {
+    await page.goto("https://www.canva.com/login", { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(3000);
+  } catch (e) {
+    await context.close().catch(() => {});
+    throw new Error(`Canva のログイン画面を開けませんでした: ${e.message.split("\n")[0]}`);
+  }
   state.context = context;
   state.page = page;
   state.status = "ready";
@@ -220,8 +225,15 @@ async function actionStart(pageNumber, month) {
   pushLog(`📥 ${year}年${monthNum}月: ${days.length}日分取得 / ${dayCellMap.length}日割当`);
 
   const { context, page } = await launchBrowser();
-  await page.goto(config.canva.designUrl, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(8000);
+  try {
+    await page.goto(config.canva.designUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(8000);
+  } catch (e) {
+    // ここで失敗すると state.context が未設定のまま Chromium だけ残り、
+    // 画面も「起動中...」で固まる。 後始末してから分かる形で返す。
+    await context.close().catch(() => {});
+    throw new Error(`Canva を開けませんでした: ${e.message.split("\n")[0]}`);
+  }
 
   state.context = context;
   state.page = page;
@@ -518,7 +530,7 @@ ${CLOUD_MODE ? `
 </details>` : ""}
 
 <script>
-let shotTimer=null, statusTimer=null;
+let shotTimer=null, statusTimer=null, lastStatus=null;
 async function api(path, body){
   const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
   return r.json();
@@ -530,7 +542,7 @@ async function start(){
   const month = document.getElementById('month').value;
   const r = await api('/api/start',{page,month});
   if(!r.ok) alert('起動失敗: '+r.error);
-  setBusy(false); refreshShot();
+  setBusy(false);
 }
 async function closeBrowser(){ setBusy(true); await api('/api/close'); setBusy(false); document.getElementById('shot').style.display='none'; document.getElementById('shotEmpty').style.display='flex'; }
 function refreshShot(){
@@ -589,6 +601,11 @@ async function poll(){
     // 書込み中はスクショ自動更新
     if(r.status==='writing' && !shotTimer){ shotTimer=setInterval(refreshShot,2000); }
     if(r.status!=='writing' && shotTimer){ clearInterval(shotTimer); shotTimer=null; }
+    // 状態が変わったらプレビューを自動取得する (起動完了・書込み完了を待たずに見えるように)
+    if(r.status!==lastStatus){
+      lastStatus=r.status;
+      if(r.status==='ready'||r.status==='done'||r.status==='error') setTimeout(refreshShot,500);
+    }
     pollFail=0;
   }catch(e){
     // 数回続けて届かない = サーバー停止 (AWSの自動停止など)
@@ -705,6 +722,12 @@ const server = http.createServer(async (req, res) => {
     }
     res.writeHead(404); res.end("not found");
   } catch (e) {
+    // 失敗したまま "launching" 等で固まらないよう、 状態を error に戻す
+    if (state.status === "launching" && !state.context) {
+      state.status = "error";
+      state.statusMsg = e.message;
+      pushLog("❌ " + e.message);
+    }
     sendJSON(res, 500, { ok: false, error: e.message });
   }
 });
