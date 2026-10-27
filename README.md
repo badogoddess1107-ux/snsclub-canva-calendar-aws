@@ -5,8 +5,8 @@ Google カレンダー → Canva の月間カレンダーテンプレへ自動�
 どちらも **AWS Fargate で「使う時だけ」動く**。田畑のMacは不要で、**固定費が発生するリソースは無い**。
 
 ```
-スタッフ ──► 起動ページ（Lambda, 無料枠）──► Fargate タスク [Web UI + ngrok]
-                                                  │  ngrok の固定URLで公開（無料）
+スタッフ ──► 起動ページ（Lambda, 無料枠）──► Fargate タスク [Web UI + Tailscale]
+                                                  │  Tailscale Funnel の固定URLで公開（無料・警告ページなし）
                                                   │  無操作60分で自分で停止 ＝ 課金停止
                                                   ▼
                                                 Canva（ログイン状態は S3 から復元）
@@ -32,7 +32,9 @@ EventBridge Scheduler（毎月25日 9:00 JST）──► Fargate タスク [月�
 - **Canva のログイン状態は S3**（`session/canva-storageState.json`）に保存し、Web UI と月次バッチで共有する。タスクが入れ替わっても消えない。
 - **ログインだけは人が行う**。Web UI の「🔑 Canvaログイン」でスクショをクリック・文字入力してログインし、「ログイン状態を保存」を押す（メール認証コードもこの画面で入力できる）。手元PCでログインして保存する `npm run session:login` もある。
 - 月次バッチは S3 のログイン状態が無い／切れていると **明確なエラーで止まる**（誤ったページに書かない）。Discord Webhook を設定すれば成否が通知される。
-- ngrok 無料プランは 1 アカウント 1 接続。Mac 側の ngrok（`com.user.ngrok-canva`）と同じアカウントを使うなら、AWS 稼働確認後に Mac 側を止める。
+- 公開は **Tailscale Funnel**。コンテナ内で `tailscale/tailscale` を userspace モードで動かすため、Fargate でも特権不要。
+  認証キーは **再利用可・エフェメラル** を推奨（タスク終了時にノードが自動削除され、次回同じホスト名を再取得できる）。
+  ※ 前回のノードが消える前に起動し直すと `-1` が付いた別URLになる。その場合は Tailscale 管理画面で古いノードを削除する。
 
 ## ファイル構成
 ```
@@ -62,10 +64,13 @@ aws cloudformation deploy \
     SubnetIds='subnet-aaaa,subnet-bbbb' \
     WebPassword='Web UI のパスワード' \
     StartPageKey='起動ページのパスワード' \
-    NgrokAuthtoken='ngrok の Authtoken' \
-    NgrokDomain='syrup-figment-submitter.ngrok-free.dev' \
+    TailscaleAuthKey='tskey-auth-xxxxx' \
+    TailscaleHostname='snsclub-canva' \
     DiscordNotifyWebhookUrl='https://discord.com/api/webhooks/...'   # 任意
 ```
+公開URLは **Tailscale Funnel**（`https://<TailscaleHostname>.<tailnet名>.ts.net/`）。警告ページは出ない。
+`TailscaleAuthKey` を空にすると代わりに ngrok を使う（`NgrokAuthtoken` / `NgrokDomain` を指定。
+ただし無料プランの警告ページが挟まり、広告ブロッカー環境では真っ白になることがある）。
 `VpcId` / `SubnetIds` は既存VPC（既定VPCでよい）とそのパブリックサブネット2つ以上。VPC を新しく作らないのは、アカウントの VPC/IGW 上限でスタック作成が失敗するため。
 ```bash
 # 既定VPCとサブネットの確認
@@ -160,4 +165,4 @@ CANVA_WEB_PASSWORD=xxxx npm run web
 - `Dockerfile` の Playwright イメージのタグ（`v1.59.1-jammy`）と `package.json` の `playwright` のバージョンは揃える。
 - Canva 側の UI 変更で操作が失敗することがある。Web UI の進捗ログとスクショで状況を確認する。
 - AWS の IP からのログインを Canva が不審と判断し、メール認証を求めることがある。その場合も「🔑 Canvaログイン」画面でコードを入力できる。
-- ngrok 無料プランはアカウントごとに同時1接続。Mac 側の ngrok を止めずに AWS を起動すると片方が繋がらない。
+- Tailscale 管理画面で、対象ノードに Funnel が許可されている必要がある（既存の Mac と同じ tailnet なら通常はそのまま使える）。

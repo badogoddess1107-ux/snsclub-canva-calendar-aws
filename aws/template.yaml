@@ -6,7 +6,7 @@ Description: >-
 # ============================================================
 # 構成（固定費が発生するリソースは無い）
 #   起動ページ (Lambda Function URL, 無料枠) ──► RunTask ──► Fargate Task [app + ngrok]
-#        スタッフはここでパスワードを入れて「起動」→ 2分後に ngrok の固定URLを開く
+#        スタッフはここでパスワードを入れて「起動」→ 2分後に公開URL（Tailscale Funnel / ngrok）を開く
 #        Web UI は CANVA_IDLE_EXIT_MINUTES 分 無操作なら自分で終了（＝課金停止）
 #   EventBridge Scheduler (毎月25日 9:00 JST) ──► RunTask ──► Fargate Task [app のみ] runScheduled.js --auto
 #   ネットワーク: 既存VPCのパブリックサブネットを使う（VPC/IGW の上限に当たらないよう新規作成しない）
@@ -44,10 +44,23 @@ Parameters:
   NgrokAuthtoken:
     Type: String
     NoEcho: true
-    Description: ngrok の Authtoken（ダッシュボード → Your Authtoken）。Mac で使っていた canva 用アカウントを流用可
+    Default: ''
+    Description: ngrok の Authtoken。TailscaleAuthKey を使う場合は空でよい
+  TailscaleAuthKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      Tailscale の認証キー（再利用可・エフェメラル推奨）。設定すると公開が ngrok ではなく
+      Tailscale Funnel になり、ngrok の警告ページが出なくなる。空なら ngrok を使う
+  TailscaleHostname:
+    Type: String
+    Default: snsclub-canva
+    Description: Tailscale 上のホスト名。公開URLは https://<これ>.<tailnet名>.ts.net になる
   NgrokDomain:
     Type: String
-    Description: ngrok の固定ドメイン（例 syrup-figment-submitter.ngrok-free.dev）。https:// は付けない
+    Default: ''
+    Description: ngrok の固定ドメイン（例 syrup-figment-submitter.ngrok-free.dev）。Tailscale を使う場合は空でよい
   IdleExitMinutes:
     Type: Number
     Default: 60
@@ -81,6 +94,7 @@ Parameters:
 
 Conditions:
   HasDesignUrl: !Not [!Equals [!Ref CanvaDesignUrl, '']]
+  UseTailscale: !Not [!Equals [!Ref TailscaleAuthKey, '']]
 
 Resources:
   # ------------------------------------------------------------
@@ -253,18 +267,45 @@ Resources:
               awslogs-group: !Ref LogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: web
-        - Name: ngrok
-          Image: ngrok/ngrok:latest
-          Essential: false         # ngrok が落ちても app は続行（ログイン状態の保存などを守る）
-          Command: ['http', '4545', '--url', !Sub 'https://${NgrokDomain}', '--log', 'stdout']
-          Environment:
-            - { Name: NGROK_AUTHTOKEN, Value: !Ref NgrokAuthtoken }
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref LogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: ngrok
+        # 公開方法は TailscaleAuthKey の有無で切り替わる（両方動かすと二重公開になるため排他）。
+        # Tailscale Funnel を使うと ngrok の警告ページ（JS描画のため広告ブロッカーで真っ白になる）が無くなる。
+        - !If
+          - UseTailscale
+          - Name: tailscale
+            Image: tailscale/tailscale:stable
+            Essential: false       # 公開が落ちても app は続行（ログイン状態の保存などを守る）
+            # serve 設定ファイルを書いてから containerboot を起動する。
+            # ${TS_CERT_DOMAIN} は containerboot が実際のホスト名に置換する。
+            EntryPoint: ['/bin/sh', '-c']
+            Command:
+              - >-
+                printf '%s'
+                '{"TCP":{"443":{"HTTPS":true}},"Web":{"${TS_CERT_DOMAIN}:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4545"}}}},"AllowFunnel":{"${TS_CERT_DOMAIN}:443":true}}'
+                > /tmp/serve.json && exec /usr/local/bin/containerboot
+            Environment:
+              - { Name: TS_AUTHKEY, Value: !Ref TailscaleAuthKey }
+              - { Name: TS_HOSTNAME, Value: !Ref TailscaleHostname }
+              - { Name: TS_SERVE_CONFIG, Value: /tmp/serve.json }
+              - { Name: TS_STATE_DIR, Value: /tmp/ts-state }
+              - { Name: TS_USERSPACE, Value: 'true' }   # Fargate には TUN デバイスが無いため必須
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref LogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: tailscale
+          - Name: ngrok
+            Image: ngrok/ngrok:latest
+            Essential: false       # ngrok が落ちても app は続行
+            Command: ['http', '4545', '--url', !Sub 'https://${NgrokDomain}', '--log', 'stdout']
+            Environment:
+              - { Name: NGROK_AUTHTOKEN, Value: !Ref NgrokAuthtoken }
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref LogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: ngrok
 
   # ---- 月次バッチ用タスク: app のみ（ngrok 不要）----
   BatchTaskDefinition:
@@ -340,7 +381,7 @@ Resources:
           TASK_DEF: !Sub '${ProjectName}-web'   # family 名 (最新リビジョンが使われる)
           SUBNETS: !Join [',', !Ref SubnetIds]
           SECURITY_GROUP: !Ref TaskSecurityGroup
-          WEB_URL: !Sub 'https://${NgrokDomain}/'
+          WEB_URL: !If [UseTailscale, !Sub 'https://${TailscaleHostname}.（tailnet名）.ts.net/', !Sub 'https://${NgrokDomain}/']
           START_KEY: !Ref StartPageKey
           IDLE_MINUTES: !Ref IdleExitMinutes
       Code:
@@ -407,8 +448,11 @@ Outputs:
     Description: スタッフに配る「起動ページ」の URL（パスワードは StartPageKey）
     Value: !GetAtt StartFunctionUrl.FunctionUrl
   WebUrl:
-    Description: 起動後にアクセスする Web UI の URL（ngrok 固定ドメイン）
-    Value: !Sub 'https://${NgrokDomain}/'
+    Description: 起動後にアクセスする Web UI の URL
+    Value: !If
+      - UseTailscale
+      - !Sub 'https://${TailscaleHostname}.<tailnet>.ts.net/ （tailnet名は Tailscale 管理画面で確認）'
+      - !Sub 'https://${NgrokDomain}/'
   EcrRepositoryUri:
     Description: GitHub Actions の push 先
     Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}'
